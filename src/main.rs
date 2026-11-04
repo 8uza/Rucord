@@ -80,7 +80,15 @@ struct AppState {
     texture_rx: mpsc::Receiver<Vec<u8>>,
     input: String,
     tokens: Vec<(String, String)>,
+    view_mode: ViewMode,
+    online_users: Vec<(String, String)>,
+    home_search: String,
+    server_ctx_menu: Option<String>,
+    dm_ctx_menu: Option<String>,
 }
+
+#[derive(Clone, PartialEq)]
+enum ViewMode { Home, Chat }
 struct App {
     state: Arc<Mutex<AppState>>,
     tx: mpsc::Sender<Result<String, String>>,
@@ -110,6 +118,11 @@ impl App {
             texture_rx,
             input: String::new(),
             tokens: load_tokens(),
+            view_mode: ViewMode::Home,
+            online_users: Vec::new(),
+            home_search: String::new(),
+            server_ctx_menu: None,
+            dm_ctx_menu: None,
         };
         let mut st = st;
         let c = load_cache();
@@ -234,18 +247,28 @@ impl eframe::App for App {
                 egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         if ui.button("Home").clicked() {
+                            s.view_mode = ViewMode::Home;
                             s.selected_channel = None;
                             s.messages.clear();
                             s.status = "Home".into();
                             if let Some(t) = s.token.clone() {
                                 let state = self.state.clone();
+                                let token_clone = s.token.clone();
                                 std::thread::spawn(move || {
-                                    if let Ok(chs) = discord::dm_channels(&t) {
+                                    let token = token_clone.as_deref().unwrap_or("");
+                                    if let Ok(chs) = discord::dm_channels(token) {
                                         let mut st = state.lock().unwrap();
-                                        st.channels = chs;
-                                        save_cache(&st.guilds, &st.channels, &st.guild_channels);
+                                        st.channels = chs.clone();
+                                        st.online_users = chs.iter()
+                                            .filter_map(|c| {
+                                                let name = c.recipients.first()?;
+                                                let display = name.global_name.clone().unwrap_or_else(|| name.username.clone());
+                                                Some((c.id.clone(), display))
+                                            })
+                                            .collect();
                                         st.selected_channel = None;
                                         st.messages.clear();
+                                        save_cache(&st.guilds, &st.channels, &st.guild_channels);
                                     }
                                 });
                             }
@@ -273,9 +296,60 @@ impl eframe::App for App {
                                     }
                                 }
                                 let click = if let Some(tex) = s.guild_icons.get(&g.id) {
-                                    ui.add(egui::Button::image((tex.id(), egui::vec2(32.0, 32.0))).frame(false)).on_hover_text(&g.name).clicked()
+                                    let btn = ui.add(egui::Button::image((tex.id(), egui::vec2(32.0, 32.0))).frame(false)).on_hover_text(&g.name);
+                                    btn.context_menu(|ui| {
+                                        if ui.button("Mute Server").clicked() {
+                                            if let Some(t) = s.token.clone() {
+                                                let state = self.state.clone();
+                                                let gid_mute = g.id.clone();
+                                                std::thread::spawn(move || {
+                                                    let _ = discord::mute_guild(&state.lock().unwrap().token.clone().unwrap_or_default(), &gid_mute);
+                                                });
+                                            }
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Leave Server").clicked() {
+                                            if let Some(t) = s.token.clone() {
+                                                let state = self.state.clone();
+                                                let gid_leave = g.id.clone();
+                                                std::thread::spawn(move || {
+                                                    let _ = discord::leave_guild(&state.lock().unwrap().token.clone().unwrap_or_default(), &gid_leave);
+                                                    let state2 = state.clone();
+                                                    std::thread::spawn(move || {
+                                                        if let Ok(gs) = discord::guilds(&state2.lock().unwrap().token.clone().unwrap_or_default()) {
+                                                            let mut st3 = state2.lock().unwrap();
+                                                            st3.guilds = gs;
+                                                            if st3.selected_guild.as_deref() == Some(&gid_leave) {
+                                                                st3.selected_guild = None;
+                                                                st3.channels.clear();
+                                                                st3.messages.clear();
+                                                            }
+                                                        }
+                                                    });
+                                                });
+                                            }
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Create Invite").clicked() {
+                                            if let Some(t) = s.token.clone() {
+                                                let state = self.state.clone();
+                                                let gid_invite = g.id.clone();
+                                                std::thread::spawn(move || {
+                                                    if let Ok(inv) = discord::create_invite(&state.lock().unwrap().token.clone().unwrap_or_default(), &gid_invite) {
+                                                        if let Some(code) = inv.get("code").and_then(|c| c.as_str()) {
+                                                            let url = format!("https://discord.gg/{}", code);
+                                                            let _ = open::that(&url);
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                            ui.close_menu();
+                                        }
+                                    });
+                                    btn.clicked()
                                 } else { false };
                                 if click {
+                                    s.view_mode = ViewMode::Chat;
                                     s.selected_guild = Some(g.id.clone());
                                     s.channels.clear();
                                     if let Some(t) = s.token.clone() {
@@ -296,6 +370,7 @@ impl eframe::App for App {
                                 }
                             } else {
                                 if ui.add(egui::Button::new(&g.name).frame(true).min_size(egui::vec2(40.0, 32.0))).on_hover_text(&g.name).clicked() {
+                                    s.view_mode = ViewMode::Chat;
                                     s.selected_guild = Some(g.id.clone());
                                     s.channels.clear();
                                     if let Some(t) = s.token.clone() {
@@ -325,6 +400,7 @@ let name = c.name.clone().unwrap_or_else(|| {
     if c.recipients.is_empty() { format!("ch-{}", c.id) } else { c.recipients.iter().map(|u| u.username.clone()).collect::<Vec<_>>().join(", ") }
 });
                         if ui.selectable_label(s.selected_channel.as_deref() == Some(&c.id), &name).clicked() {
+                            s.view_mode = ViewMode::Chat;
                             s.selected_channel = Some(c.id.clone());
                             s.messages.clear();
                             if let Some(t) = s.token.clone() {
@@ -359,19 +435,119 @@ let name = c.name.clone().unwrap_or_else(|| {
                     if ui.button("Logout").clicked() { s.token = None; }
                 });
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.heading("Chat");
-                    egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-                        let mut to_view: Option<String> = None;
-                        for m in s.messages.iter().rev() {
-                            ui.label(format!("{}: {}", m.author.username, m.content));
-                            for a in &m.attachments {
-                                ui.horizontal(|ui| {
-                                    if ui.button(format!("[{}]", a.filename)).clicked() { to_view = Some(a.url.clone()); }
-                                });
+                    match s.view_mode {
+                        ViewMode::Home => {
+                            ui.heading("Home");
+                            ui.label("Friends / Direct Messages");
+                            ui.add_space(5.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Search:");
+                                ui.text_edit_singleline(&mut s.home_search);
+                            });
+                            ui.add_space(5.0);
+                            let search = s.home_search.to_lowercase();
+                            let filtered: Vec<(String, String)> = s.online_users.iter()
+                                .filter(|(_, name)| name.to_lowercase().contains(&search))
+                                .cloned()
+                                .collect();
+                            let mut open_chat: Option<String> = None;
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                if filtered.is_empty() {
+                                    ui.label("No users found.");
+                                } else {
+                                    for (cid, name) in &filtered {
+                                        ui.horizontal(|ui| {
+                                            let rsp = ui.selectable_label(s.selected_channel.as_deref() == Some(cid), name);
+                                            rsp.context_menu(|ui| {
+                                                if ui.button("Close DM").clicked() {
+                                                    if let Some(t) = s.token.clone() {
+                                                        let state = self.state.clone();
+                                                        let cid_close = cid.clone();
+                                                        std::thread::spawn(move || {
+                                                            let _ = discord::close_dm(&t, &cid_close);
+                                                            let state2 = state.clone();
+                                                            std::thread::spawn(move || {
+                                                                if let Some(token) = state2.lock().unwrap().token.clone() {
+                                                                    if let Ok(chs) = discord::dm_channels(&token) {
+                                                                        let mut st3 = state2.lock().unwrap();
+                                                                        st3.channels = chs.clone();
+                                                                        st3.online_users = chs.iter()
+                                                                            .filter_map(|c| {
+                                                                                let name = c.recipients.first()?;
+                                                                                let display = name.global_name.clone().unwrap_or_else(|| name.username.clone());
+                                                                                Some((c.id.clone(), display))
+                                                                            })
+                                                                            .collect();
+                                                                    }
+                                                                }
+                                                            });
+                                                        });
+                                                    }
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button("Block User").clicked() {
+                                                    if let Some(c) = s.channels.iter().find(|c| c.id == *cid) {
+                                                        if let Some(u) = c.recipients.first() {
+                                                            let state = self.state.clone();
+                                                            let uid_block = u.id.clone();
+                                                            std::thread::spawn(move || {
+                                                                let _ = discord::block_user(&state.lock().unwrap().token.clone().unwrap_or_default(), &uid_block);
+                                                            });
+                                                        }
+                                                    }
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button("Unfriend").clicked() {
+                                                    if let Some(c) = s.channels.iter().find(|c| c.id == *cid) {
+                                                        if let Some(u) = c.recipients.first() {
+                                                            let state = self.state.clone();
+                                                            let uid_unfriend = u.id.clone();
+                                                            std::thread::spawn(move || {
+                                                                let _ = discord::unfriend_user(&state.lock().unwrap().token.clone().unwrap_or_default(), &uid_unfriend);
+                                                            });
+                                                        }
+                                                    }
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                            if rsp.clicked() {
+                                                open_chat = Some(cid.clone());
+                                            }
+                                        });
+                                    }
+                                }
+                            });
+                            if let Some(cid) = open_chat {
+                                s.view_mode = ViewMode::Chat;
+                                s.selected_channel = Some(cid.clone());
+                                s.messages.clear();
+                                if let Some(t) = s.token.clone() {
+                                    let state = self.state.clone();
+                                    let cid = cid.clone();
+                                    std::thread::spawn(move || {
+                                        if let Ok(ms) = discord::messages(&t, &cid, 50) {
+                                            state.lock().unwrap().messages = ms;
+                                        }
+                                    });
+                                }
                             }
                         }
-                        if let Some(u) = to_view { s.viewing_url = Some(u); s.viewing_texture = None; }
-                    });
+                        ViewMode::Chat => {
+                            ui.heading("Chat");
+                            egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+                                let mut to_view: Option<String> = None;
+                                for m in s.messages.iter().rev() {
+                                    ui.label(format!("{}: {}", m.author.username, m.content));
+                                    for a in &m.attachments {
+                                        ui.horizontal(|ui| {
+                                            if ui.button(format!("[{}]", a.filename)).clicked() { to_view = Some(a.url.clone()); }
+                                        });
+                                    }
+                                }
+                                if let Some(u) = to_view { s.viewing_url = Some(u); s.viewing_texture = None; }
+                            });
+                        }
+                    }
                 });
             }
         });
@@ -382,6 +558,15 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
     eframe::run_native("Rucord", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
+
+
+
+
+
+
+
+
+
 
 
 
